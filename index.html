@@ -382,13 +382,17 @@ const FORM_VERSION='smdu-apontamentos-v2-appsscript-1';
 const SCHEMA_VERSION=1;
 const MESSAGE_SOURCE='smdu-apontamentos-apps-script-v1';
 const APPS_SCRIPT_URL=String(window.FORM_CONFIG?.appsScriptUrl||'').trim();
-const SEND_TIMEOUT_MS=90000;
+const CONFIRM_WINDOW_MS=180000;
+const CONFIRM_POLL_MS=2500;
+const CONFIRM_REQUEST_TIMEOUT_MS=12000;
+const STATUS_CALLBACK='__smduStatusCallback';
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const hoje=()=>new Date().toISOString().slice(0,10);
 let timer=null;
 let toastTimer=null;
 let pendingSubmission=null;
+let confirmationPoll=null;
 const syncVazio=()=>({submissionId:'',status:'draft',protocol:'',receivedAt:'',lastAttempt:'',message:''});
 let sync=syncVazio();
 
@@ -452,13 +456,13 @@ function mostrarFormulario(){$('introView').classList.remove('show');$('formView
 function apresentacaoEnvio(){
   const status=sync.status==='sending'?'pending':sync.status||'draft';
   if(status==='sent')return {cls:'sent',titulo:'Envio confirmado',detalhe:[sync.protocol,sync.receivedAt?`recebido em ${new Date(sync.receivedAt).toLocaleString('pt-BR')}`:''].filter(Boolean).join(' · ')};
-  if(status==='pending')return {cls:'pending',titulo:'Envio sem confirmação',detalhe:sync.message||'As respostas permanecem salvas. Use “Enviar respostas” novamente para recuperar a confirmação.'};
+  if(status==='pending')return {cls:'pending',titulo:'Recebimento em verificação',detalhe:sync.message||'As respostas estão preservadas. Use “Verificar recebimento” para consultar a planilha novamente.'};
   if(status==='error')return {cls:'error',titulo:'Falha no envio',detalhe:sync.message||'As respostas permanecem salvas neste navegador.'};
   if(status==='changed')return {cls:'pending',titulo:'Alterado após o envio',detalhe:'A versão modificada ainda não foi recebida pela SUPLAN.'};
   return {cls:'',titulo:'Ainda não enviado',detalhe:'O conteúdo está somente neste navegador até que o envio seja confirmado.'};
 }
-function atualizarPainelEnvio(){const p=apresentacaoEnvio();$('syncBox').className=`sync-box ${sync.status==='sending'?'sending':p.cls}`.trim();$('syncTitle').textContent=sync.status==='sending'?'Enviando…':p.titulo;$('syncDetail').textContent=sync.status==='sending'?'Aguarde a confirmação da planilha.':p.detalhe;const b=$('enviar');if(b){b.disabled=!!pendingSubmission||sync.status==='sent';b.textContent=sync.status==='sent'?'Envio confirmado':pendingSubmission?'Enviando…':'Enviar respostas';}}
-function marcarAlterado(){if(sync.status==='sent'){sync={...sync,status:'changed',submissionId:'',protocol:'',receivedAt:'',message:''};}else if(sync.status==='error'){sync={...sync,status:'draft',message:''};}atualizarPainelEnvio();}
+function atualizarPainelEnvio(){const p=apresentacaoEnvio();const busy=!!confirmationPoll;const sending=sync.status==='sending'||busy;$('syncBox').className=`sync-box ${sending?'sending':p.cls}`.trim();$('syncTitle').textContent=sending?'Enviando e confirmando…':p.titulo;$('syncDetail').textContent=sending?'Aguarde: a página está verificando o protocolo diretamente na planilha.':p.detalhe;const b=$('enviar');if(b){b.disabled=busy||sync.status==='sent';b.textContent=sync.status==='sent'?'Envio confirmado':busy?'Confirmando…':sync.status==='pending'?'Verificar recebimento':'Enviar respostas';}}
+function marcarAlterado(){if(['sent','pending','sending'].includes(sync.status)){pararVerificacao();sync={...sync,status:'changed',submissionId:'',protocol:'',receivedAt:'',message:''};}else if(sync.status==='error'){sync={...sync,status:'draft',message:''};}atualizarPainelEnvio();}
 
 function limparErros(){document.querySelectorAll('.error').forEach(e=>e.classList.remove('error'));
   document.querySelectorAll('.error-note').forEach(e=>e.classList.remove('show'));}
@@ -623,21 +627,79 @@ async function carregarPDF(ev){
   finally{ev.target.value='';}
 }
 function payloadEnvio(nonce){return {source:'formulario-avaliacao-smdu-bh',schemaVersion:SCHEMA_VERSION,formVersion:FORM_VERSION,submissionId:sync.submissionId,requestNonce:nonce,website:$('organizationWebsite')?.value||'',clientSavedAt:new Date().toISOString(),...dados};}
+function limparRequisicaoStatus(){
+  if(!confirmationPoll)return;
+  clearTimeout(confirmationPoll.requestTimer);confirmationPoll.requestTimer=null;
+  if(confirmationPoll.script?.parentNode)confirmationPoll.script.remove();
+  confirmationPoll.script=null;
+}
+function pararVerificacao(){
+  if(confirmationPoll){clearTimeout(confirmationPoll.nextTimer);limparRequisicaoStatus();}
+  confirmationPoll=null;pendingSubmission=null;
+}
+function confirmarRecebimento(msg,recuperado=false){
+  pararVerificacao();
+  sync={...sync,status:'sent',protocol:String(msg.protocol||''),receivedAt:String(msg.receivedAt||''),message:'',lastAttempt:new Date().toISOString()};
+  salvar();atualizarPainelEnvio();
+  statusAcao(recuperado?'O recebimento foi localizado na planilha e confirmado.':`Respostas recebidas com sucesso${sync.protocol?` — protocolo ${sync.protocol}`:''}.`);
+  toast('Envio confirmado.');
+}
+function encerrarVerificacaoPendente(){
+  limparRequisicaoStatus();confirmationPoll=null;pendingSubmission=null;
+  sync.status='pending';
+  sync.message='A verificação automática ainda não foi concluída. As respostas continuam salvas; use “Verificar recebimento” para consultar novamente sem duplicar o envio.';
+  salvar();atualizarPainelEnvio();statusAcao('Recebimento em verificação. Suas respostas estão preservadas e podem ser consultadas novamente.');
+}
+function agendarConsultaStatus(delay=CONFIRM_POLL_MS){
+  if(!confirmationPoll)return;
+  if(Date.now()-confirmationPoll.startedAt>=CONFIRM_WINDOW_MS){encerrarVerificacaoPendente();return;}
+  clearTimeout(confirmationPoll.nextTimer);
+  confirmationPoll.nextTimer=setTimeout(consultarStatus,delay);
+}
+function consultarStatus(){
+  if(!confirmationPoll)return;
+  limparRequisicaoStatus();
+  const script=document.createElement('script');
+  const url=new URL(APPS_SCRIPT_URL);
+  url.searchParams.set('action','status');
+  url.searchParams.set('submissionId',confirmationPoll.submissionId);
+  url.searchParams.set('callback',STATUS_CALLBACK);
+  url.searchParams.set('_',String(Date.now()));
+  script.async=true;script.src=url.toString();
+  script.onerror=()=>{if(!confirmationPoll||confirmationPoll.script!==script)return;limparRequisicaoStatus();agendarConsultaStatus();};
+  confirmationPoll.script=script;
+  confirmationPoll.requestTimer=setTimeout(()=>{if(!confirmationPoll||confirmationPoll.script!==script)return;limparRequisicaoStatus();agendarConsultaStatus();},CONFIRM_REQUEST_TIMEOUT_MS);
+  document.head.appendChild(script);
+}
+window[STATUS_CALLBACK]=msg=>{
+  if(!confirmationPoll)return;
+  const expected=confirmationPoll.submissionId;
+  limparRequisicaoStatus();
+  if(msg&&typeof msg==='object'&&msg.source===MESSAGE_SOURCE&&msg.submissionId===expected&&msg.ok&&msg.found){confirmarRecebimento(msg,true);return;}
+  agendarConsultaStatus();
+};
+function iniciarVerificacao(silenciosa=false){
+  if(confirmationPoll||!sync.submissionId||!envioConfigurado())return;
+  sync.status='sending';sync.message='';
+  confirmationPoll={submissionId:sync.submissionId,startedAt:Date.now(),script:null,requestTimer:null,nextTimer:null};
+  salvar();atualizarPainelEnvio();
+  if(!silenciosa)statusAcao('Envio realizado. Confirmando o recebimento diretamente na planilha…');
+  consultarStatus();
+}
 function enviar(){
-  if(pendingSubmission){statusAcao('Já existe um envio aguardando confirmação.');return;}
+  if(confirmationPoll){statusAcao('A página já está confirmando o recebimento na planilha.');return;}
   if(sync.status==='sent'){statusAcao(`Este conteúdo já foi recebido${sync.protocol?` sob o protocolo ${sync.protocol}`:''}. Altere alguma resposta para enviar uma nova versão.`);return;}
   if(!envioConfigurado()){sync={...sync,status:'error',message:'O endereço do aplicativo web ainda não foi configurado em config.js.'};salvar();atualizarPainelEnvio();statusAcao('O envio ainda não está configurado. Use o CSV ou o PDF para guardar as respostas.');return;}
   if(!validar()){statusAcao('Revise os campos destacados antes de enviar.');return;}
   sync.submissionId=sync.submissionId||uuid();sync.status='sending';sync.message='';sync.lastAttempt=new Date().toISOString();
   const nonce=uuid();salvar();atualizarPainelEnvio();statusAcao('Enviando respostas…');
-  const timeout=setTimeout(()=>{if(!pendingSubmission||pendingSubmission.nonce!==nonce)return;pendingSubmission=null;sync.status='pending';sync.message='A planilha não confirmou o recebimento dentro do tempo esperado.';salvar();atualizarPainelEnvio();statusAcao('Envio sem confirmação. As respostas foram preservadas; tente enviar novamente para recuperar a confirmação.');},SEND_TIMEOUT_MS);
-  pendingSubmission={nonce,timeout};$('remoteSubmissionForm').action=APPS_SCRIPT_URL;$('remotePayload').value=JSON.stringify(payloadEnvio(nonce));$('remoteSubmissionForm').submit();
+  pendingSubmission={nonce};$('remoteSubmissionForm').action=APPS_SCRIPT_URL;$('remotePayload').value=JSON.stringify(payloadEnvio(nonce));$('remoteSubmissionForm').submit();
+  iniciarVerificacao();
 }
 function mensagemEnvio(ev){
   const msg=ev.data;if(!pendingSubmission||!msg||typeof msg!=='object'||msg.source!==MESSAGE_SOURCE||msg.nonce!==pendingSubmission.nonce)return;
-  clearTimeout(pendingSubmission.timeout);pendingSubmission=null;
-  if(msg.ok){sync={...sync,status:'sent',protocol:String(msg.protocol||''),receivedAt:String(msg.receivedAt||''),message:'',lastAttempt:new Date().toISOString()};salvar();atualizarPainelEnvio();statusAcao(msg.duplicate?'O envio já constava na planilha; a confirmação foi recuperada.':`Respostas recebidas com sucesso${sync.protocol?` — protocolo ${sync.protocol}`:''}.`);toast('Envio confirmado.');}
-  else{sync={...sync,status:'error',message:String(msg.message||'Não foi possível confirmar o envio.'),lastAttempt:new Date().toISOString()};salvar();atualizarPainelEnvio();statusAcao(sync.message);toast('Falha no envio; respostas preservadas.');}
+  if(msg.ok){confirmarRecebimento(msg,!!msg.duplicate);}
+  else{pararVerificacao();sync={...sync,status:'error',message:String(msg.message||'Não foi possível registrar o envio.'),lastAttempt:new Date().toISOString()};salvar();atualizarPainelEnvio();statusAcao(sync.message);toast('Não foi possível enviar; respostas preservadas.');}
 }
 
 document.addEventListener('click',ev=>{
@@ -670,6 +732,7 @@ window.addEventListener('message',mensagemEnvio);
 window.addEventListener('beforeunload',salvar);
 
 restaurar();renderTudo();atualizarPainelEnvio();
+if(sync.status==='pending'&&sync.submissionId&&envioConfigurado())setTimeout(()=>iniciarVerificacao(true),500);
 </script>
 </body>
 </html>
