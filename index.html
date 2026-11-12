@@ -382,7 +382,7 @@ const FORM_VERSION='smdu-apontamentos-v2-appsscript-1';
 const SCHEMA_VERSION=1;
 const MESSAGE_SOURCE='smdu-apontamentos-apps-script-v1';
 const APPS_SCRIPT_URL=String(window.FORM_CONFIG?.appsScriptUrl||'').trim();
-const SEND_TIMEOUT_MS=30000;
+const SEND_TIMEOUT_MS=90000;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const hoje=()=>new Date().toISOString().slice(0,10);
